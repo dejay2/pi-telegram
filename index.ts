@@ -105,6 +105,22 @@ interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	edited_message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
+}
+
+interface TelegramCallbackQuery {
+	id: string;
+	from: TelegramUser;
+	message?: {
+		message_id: number;
+		chat: TelegramChat;
+		text?: string;
+	};
+	data?: string;
+}
+
+interface TelegramCallbackAnswer {
+	ok: boolean;
 }
 
 interface TelegramGetFileResult {
@@ -298,6 +314,21 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	// chatId -> { models, messageId, page } for pending model picker keyboards
+	const pendingModelSelections = new Map<
+		number,
+		{
+			models: Array<{
+				ref: string;
+				provider: string;
+				id: string;
+				name?: string;
+				thinkingLevel?: string;
+			}>;
+			messageId: number;
+			page: number;
+		}
+	>();
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -820,11 +851,121 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/model" || lower.startsWith("/model ")) {
+			const modelArg = lower === "/model" ? undefined : rawText.slice(7).trim();
+			const chatId = firstMessage.chat.id;
+			const messageId = firstMessage.message_id;
+
+			if (modelArg) {
+				// Try to match and switch to a model
+				const allModels = ctx.modelRegistry.getAvailable();
+				const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+
+				// Try exact provider/id match first
+				let matched = allModels.find(
+					(m) => `${m.provider}/${m.id}`.toLowerCase() === modelArg.toLowerCase(),
+				);
+
+				// Then try exact id match
+				if (!matched) {
+					matched = allModels.find((m) => m.id.toLowerCase() === modelArg.toLowerCase());
+				}
+
+				// Then try partial match
+				if (!matched) {
+					const partial = allModels.filter(
+						(m) =>
+							m.provider.toLowerCase().includes(modelArg) ||
+							m.id.toLowerCase().includes(modelArg) ||
+							(m.name && m.name.toLowerCase().includes(modelArg)),
+					);
+
+					if (partial.length === 0) {
+						await sendTextReply(
+							chatId,
+							messageId,
+							`No models matching "${modelArg}".\n\nSend /model to list all available models.`,
+						);
+						return;
+					}
+
+					if (partial.length > 1) {
+						const lines = [
+							`Multiple models match "${modelArg}":`,
+							...partial.map((m) => {
+								const ref = `${m.provider}/${m.id}`;
+								const suffix = m.name && m.name !== m.id ? ` (${m.name})` : "";
+								return `  ${ref}${suffix}`;
+							}),
+							`\nBe more specific, e.g. /model ${partial[0].provider}/${partial[0].id}`,
+						];
+						await sendTextReply(chatId, messageId, lines.join("\n"));
+						return;
+					}
+
+					matched = partial[0];
+				}
+
+				const ref = `${matched.provider}/${matched.id}`;
+				if (ref === currentRef) {
+					await sendTextReply(chatId, messageId, `Already using ${ref}.`);
+					return;
+				}
+
+				const ok = await pi.setModel(matched);
+				if (ok) {
+					const nameSuffix = matched.name && matched.name !== matched.id ? ` (${matched.name})` : "";
+					await sendTextReply(
+						chatId,
+						messageId,
+						`Switched to ${ref}${nameSuffix}.`,
+					);
+				} else {
+					await sendTextReply(
+						chatId,
+						messageId,
+						`Cannot switch to ${ref} — no API key configured.`,
+					);
+				}
+			} else {
+				// Show model picker with inline keyboard
+				const allModels = ctx.modelRegistry.getAvailable();
+				const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+
+				if (allModels.length === 0) {
+					await sendTextReply(chatId, messageId, "No models available.");
+					return;
+				}
+
+				// Build model entries for the picker
+				const modelEntries = allModels.map((m) => ({
+					ref: `${m.provider}/${m.id}`,
+					provider: m.provider,
+					id: m.id,
+					name: m.name && m.name !== m.id ? m.name : undefined,
+					thinkingLevel: m.thinkingLevel,
+				}));
+
+	
+
+				// Store for callback handling
+				pendingModelSelections.set(chatId, {
+					models: modelEntries,
+					messageId,
+					page: 0,
+				});
+
+				// Render page 0
+				await renderModelPicker(chatId, messageId, modelEntries, currentRef, 0);
+			}
+			return;
+		}
+
 		if (lower === "/help" || lower === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /model, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -843,6 +984,202 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 			pi.sendUserMessage(turn.content);
 		}
+	}
+
+	// Telegram inline keyboard limits: max 8 buttons per column, ~100 buttons total
+	const MODEL_PAGE_SIZE = 5;
+
+	function buildModelKeyboard(
+		models: Array<{
+			ref: string;
+			provider: string;
+			id: string;
+			name?: string;
+			thinkingLevel?: string;
+		}>,
+		currentRef: string | null,
+		page: number,
+	): Promise<{
+		text: string;
+		keyboard: Array<Array<{ text: string; callback_data: string }>>;
+	}> {
+		const totalPages = Math.ceil(models.length / MODEL_PAGE_SIZE);
+		const start = page * MODEL_PAGE_SIZE;
+		const end = Math.min(start + MODEL_PAGE_SIZE, models.length);
+		const pageModels = models.slice(start, end);
+
+		const headerLines = [
+			`Models (${page + 1}/${totalPages})`,
+			currentRef ? `Current: ${currentRef}` : "Current: none",
+			"",
+		];
+
+		const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
+		for (const m of pageModels) {
+			const isCurrent = m.ref === currentRef;
+			const label = m.name ? m.name : m.id;
+			const prefix = isCurrent ? "✅ " : "  ";
+			keyboard.push([{
+				text: `${prefix}${label} (${m.provider})`,
+				callback_data: `model:${m.ref}`,
+			}]);
+		}
+
+		if (totalPages > 1) {
+			const navRow: Array<{ text: string; callback_data: string }> = [];
+			if (page > 0) navRow.push({ text: "⬅️ Prev", callback_data: `modelpage:${page - 1}` });
+			if (page < totalPages - 1) navRow.push({ text: "Next ➡️", callback_data: `modelpage:${page + 1}` });
+			if (navRow.length > 0) keyboard.push(navRow);
+		}
+
+		keyboard.push([{
+			text: "❌ Cancel",
+			callback_data: "model:cancel",
+		}]);
+
+		const text = headerLines.join("\n");
+		return { text, keyboard };
+	}
+
+	async function renderModelPicker(
+		chatId: number,
+		_originalMessageId: number,
+		models: Array<{
+			ref: string;
+			provider: string;
+			id: string;
+			name?: string;
+			thinkingLevel?: string;
+		}>,
+		currentRef: string | null,
+		page: number,
+		editMessageId?: number,
+	): Promise<void> {
+		const { text, keyboard } = buildModelKeyboard(models, currentRef, page);
+
+		// Guard: ensure text is never empty (Telegram rejects empty text)
+		if (!text || text.trim().length === 0) {
+			console.error("[telepi-model] renderModelPicker: text is empty, models=", models.length, "page=", page);
+			return;
+		}
+
+		try {
+			if (editMessageId !== undefined) {
+				await callTelegram<TelegramSentMessage>("editMessageText", {
+					chat_id: chatId,
+					message_id: editMessageId,
+					text,
+					reply_markup: { inline_keyboard: keyboard },
+				});
+			} else {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text,
+					reply_markup: { inline_keyboard: keyboard },
+				});
+				const pending = pendingModelSelections.get(chatId);
+				if (pending) pending.messageId = sent.message_id;
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error("[telepi-model] renderModelPicker failed:", message, "text=", JSON.stringify(text.substring(0, 100)));
+			await sendTextReply(chatId, _originalMessageId, `Failed to show model picker: ${message}`);
+		}
+	}
+
+	async function replyAndCleanup(
+		chatId: number,
+		keyboardMessageId: number,
+		resultText: string,
+	): Promise<void> {
+		try {
+			await sendTextReply(chatId, keyboardMessageId, resultText);
+		} catch (e) {
+			console.error("[telepi-model] replyAndCleanup: reply failed:", e);
+		}
+		// Clean up the keyboard message
+		try {
+			await callTelegram<any>("deleteMessage", {
+				chat_id: chatId,
+				message_id: keyboardMessageId,
+			});
+		} catch {
+			// keyboard might already be gone — ignore
+		}
+	}
+
+	async function handleModelCallback(
+		callbackQueryId: string,
+		chatId: number,
+		keyboardMessageId: number,
+		data: string,
+		ctx: ExtensionContext,
+	): Promise<boolean> {
+
+
+		try {
+			await callTelegram<TelegramCallbackAnswer>("answerCallbackQuery", {
+				callback_query_id: callbackQueryId,
+			});
+		} catch {
+			// ignore
+		}
+
+		const pending = pendingModelSelections.get(chatId);
+		if (!pending) return false;
+
+		const currentRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+
+		if (data === "model:cancel") {
+			pendingModelSelections.delete(chatId);
+			await replyAndCleanup(chatId, keyboardMessageId, "Model picker cancelled.");
+			return true;
+		}
+
+		if (data.startsWith("modelpage:")) {
+			const newPage = parseInt(data.slice(10), 10);
+			if (!isNaN(newPage) && newPage >= 0) {
+				pending.page = newPage;
+				try {
+					await renderModelPicker(chatId, keyboardMessageId, pending.models, currentRef, newPage, keyboardMessageId);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					await sendTextReply(chatId, keyboardMessageId, `Failed to render page: ${message}`);
+				}
+			}
+			return true;
+		}
+
+		if (data.startsWith("model:")) {
+			const ref = data.slice(6);
+			const matched = pending.models.find((m) => m.ref === ref);
+			if (!matched) return true;
+
+			const model = ctx.modelRegistry.find(matched.provider, matched.id);
+			if (!model) {
+				pendingModelSelections.delete(chatId);
+				await replyAndCleanup(chatId, keyboardMessageId, `Model ${ref} not found.`);
+				return true;
+			}
+
+			if (ref === currentRef) {
+				pendingModelSelections.delete(chatId);
+				await replyAndCleanup(chatId, keyboardMessageId, `Already using ${ref}.`);
+				return true;
+			}
+
+			const ok = await pi.setModel(model);
+			if (ok) {
+				pendingModelSelections.delete(chatId);
+				const nameSuffix = model.name && model.name !== model.id ? ` (${model.name})` : "";
+				await replyAndCleanup(chatId, keyboardMessageId, `Switched to ${ref}${nameSuffix}.`);
+			} else {
+				await replyAndCleanup(chatId, keyboardMessageId, `Cannot switch to ${ref} — no API key.`);
+			}
+			return true;
+		}
+
+		return false;
 	}
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
@@ -865,6 +1202,34 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+		// Handle inline keyboard callbacks (model picker)
+		if (update.callback_query) {
+			const cq = update.callback_query;
+			if (cq.from && cq.from.id !== config.allowedUserId) return;
+
+			if (cq.data && cq.message) {
+				const handled = await handleModelCallback(
+					cq.id,
+					cq.message.chat.id,
+					cq.message.message_id,
+					cq.data,
+					ctx,
+				);
+				if (handled) return;
+			}
+			// Answer unhandled callbacks to clear loading state
+			try {
+				await callTelegram<TelegramCallbackAnswer>("answerCallbackQuery", {
+					callback_query_id: cq.id,
+					text: "Unknown action.",
+					show_alert: false,
+				});
+			} catch {
+				// ignore
+			}
+			return;
+		}
+
 		const message = update.message || update.edited_message;
 		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
@@ -913,7 +1278,7 @@ export default function (pi: ExtensionAPI) {
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
 						limit: 10,
 						timeout: 30,
-						allowed_updates: ["message", "edited_message"],
+						allowed_updates: ["message", "edited_message", "callback_query"],
 					},
 					{ signal },
 				);
@@ -1023,6 +1388,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
+		if (config.botToken && !pollingPromise) { await startPolling(ctx); }
 		updateStatus(ctx);
 	});
 

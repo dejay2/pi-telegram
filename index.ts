@@ -797,6 +797,19 @@ export default function (pi: ExtensionAPI) {
 		pollingPromise = undefined;
 	}
 
+	// Synchronous abort for use inside session_shutdown / nested runtime calls.
+	// Awaiting pollingPromise from a handler that is itself running on the
+	// polling task deadlocks (e.g. pi.executeCommand("new") triggers
+	// session_shutdown which would then wait for the very poll iteration that
+	// dispatched it). Detach the controller and let the loop exit on its next
+	// signal-checked callTelegram.
+	function abortPollingForShutdown(): void {
+		stopTypingLoop();
+		pollingController?.abort();
+		pollingController = undefined;
+		pollingPromise = undefined;
+	}
+
 	function formatTelegramHistoryText(rawText: string, files: DownloadedTelegramFile[]): string {
 		let summary = rawText.length > 0 ? rawText : "(no text)";
 		if (files.length > 0) {
@@ -1551,7 +1564,10 @@ export default function (pi: ExtensionAPI) {
 		activeTelegramTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
-		await stopPolling();
+		// Use the synchronous abort variant: this handler may run *on* the polling
+		// task itself (when a Telegram-dispatched command triggers a session
+		// replacement), so awaiting pollingPromise here would self-deadlock.
+		abortPollingForShutdown();
 	});
 
 	pi.on("before_agent_start", async (event) => {

@@ -323,7 +323,6 @@ export default function (pi: ExtensionAPI) {
 				provider: string;
 				id: string;
 				name?: string;
-				thinkingLevel?: string;
 			}>;
 			messageId: number;
 			page: number;
@@ -406,6 +405,59 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
 		return data.result;
+	}
+
+	let lastSyncedCommandsHash: string | undefined;
+	let activeReverseMap: Map<string, string> = new Map();
+
+	function sanitizeTelegramCommandName(raw: string): string | undefined {
+		const lowered = raw.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "");
+		if (!lowered) return undefined;
+		return lowered.slice(0, 32);
+	}
+
+	function buildTelegramCommandList(): { payload: Array<{ command: string; description: string }>; reverseMap: Map<string, string> } {
+		const seen = new Set<string>();
+		const payload: Array<{ command: string; description: string }> = [];
+		const reverseMap = new Map<string, string>();
+
+		// Telegram conventions plus Telegram-only handlers
+		payload.push({ command: "start", description: "Pair this Telegram account with the bot" });
+		payload.push({ command: "help", description: "Show Telegram bridge help" });
+		payload.push({ command: "stop", description: "Abort the current pi turn" });
+		for (const e of payload) seen.add(e.command);
+
+		for (const cmd of pi.getCommands()) {
+			if (cmd.source === "skill") continue;
+			if (cmd.name.includes(":")) continue;
+			const tgName = sanitizeTelegramCommandName(cmd.name);
+			if (!tgName || seen.has(tgName)) continue;
+			const desc = (cmd.description ?? "pi command").slice(0, 256);
+			payload.push({ command: tgName, description: desc });
+			reverseMap.set(tgName, cmd.name);
+			seen.add(tgName);
+			if (payload.length >= 100) break;
+		}
+
+		return { payload, reverseMap };
+	}
+
+	async function syncTelegramCommands(ctx: ExtensionContext): Promise<void> {
+		if (!config.botToken) return;
+		const { payload, reverseMap } = buildTelegramCommandList();
+		activeReverseMap = reverseMap;
+		const hash = JSON.stringify(payload);
+		if (hash === lastSyncedCommandsHash) return;
+		try {
+			await callTelegram("setMyCommands", {
+				commands: payload,
+				scope: { type: "all_private_chats" },
+			});
+			lastSyncedCommandsHash = hash;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			updateStatus(ctx, `setMyCommands failed: ${message}`);
+		}
 	}
 
 	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
@@ -943,7 +995,6 @@ export default function (pi: ExtensionAPI) {
 					provider: m.provider,
 					id: m.id,
 					name: m.name && m.name !== m.id ? m.name : undefined,
-					thinkingLevel: m.thinkingLevel,
 				}));
 
 	
@@ -965,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /model, /compact, stop.`,
+				`Send me a message and I will forward it to pi.\nTap the Menu button to browse pi's slash commands — type / to filter.\nRunnable from Telegram: /model, /status, /compact, /stop (or "stop"). Other menu entries are listed for reference; run them from the pi TUI.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -973,6 +1024,19 @@ export default function (pi: ExtensionAPI) {
 				updateStatus(ctx);
 			}
 			return;
+		}
+
+		if (lower.startsWith("/")) {
+			const tgName = lower.slice(1).split(/[\s@]/)[0];
+			const piName = activeReverseMap.get(tgName);
+			if (piName) {
+				await sendTextReply(
+					firstMessage.chat.id,
+					firstMessage.message_id,
+					`/${piName} is a pi command that can't be invoked from Telegram yet. Run it from the pi TUI.`,
+				);
+				return;
+			}
 		}
 
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
@@ -995,14 +1059,13 @@ export default function (pi: ExtensionAPI) {
 			provider: string;
 			id: string;
 			name?: string;
-			thinkingLevel?: string;
 		}>,
 		currentRef: string | null,
 		page: number,
-	): Promise<{
+	): {
 		text: string;
 		keyboard: Array<Array<{ text: string; callback_data: string }>>;
-	}> {
+	} {
 		const totalPages = Math.ceil(models.length / MODEL_PAGE_SIZE);
 		const start = page * MODEL_PAGE_SIZE;
 		const end = Math.min(start + MODEL_PAGE_SIZE, models.length);
@@ -1049,7 +1112,6 @@ export default function (pi: ExtensionAPI) {
 			provider: string;
 			id: string;
 			name?: string;
-			thinkingLevel?: string;
 		}>,
 		currentRef: string | null,
 		page: number,
@@ -1307,6 +1369,7 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 		});
 		updateStatus(ctx);
+		void syncTelegramCommands(ctx);
 	}
 
 	pi.registerTool({
@@ -1390,6 +1453,7 @@ export default function (pi: ExtensionAPI) {
 		await mkdir(TEMP_DIR, { recursive: true });
 		if (config.botToken && !pollingPromise) { await startPolling(ctx); }
 		updateStatus(ctx);
+		void syncTelegramCommands(ctx);
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {

@@ -337,30 +337,38 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
-		const theme = ctx.ui.theme;
-		const label = theme.fg("accent", "telegram");
-		if (error) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
-			return;
+		// ctx may be stale if the session was replaced (e.g. /new triggered via
+		// pi.executeCommand) while the polling lifecycle still holds a reference.
+		// Touching a stale ctx throws; the status indicator is decorative, so
+		// swallow the error rather than tearing pi down.
+		try {
+			const theme = ctx.ui.theme;
+			const label = theme.fg("accent", "telegram");
+			if (error) {
+				ctx.ui.setStatus("telegram", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
+				return;
+			}
+			if (!config.botToken) {
+				ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
+				return;
+			}
+			if (!pollingPromise) {
+				ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
+				return;
+			}
+			if (!config.allowedUserId) {
+				ctx.ui.setStatus("telegram", `${label} ${theme.fg("warning", "awaiting pairing")}`);
+				return;
+			}
+			if (activeTelegramTurn || queuedTelegramTurns.length > 0) {
+				const queued = queuedTelegramTurns.length > 0 ? theme.fg("muted", ` +${queuedTelegramTurns.length} queued`) : "";
+				ctx.ui.setStatus("telegram", `${label} ${theme.fg("accent", "processing")}${queued}`);
+				return;
+			}
+			ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
+		} catch {
+			// ctx is stale after a session replacement — ignore.
 		}
-		if (!config.botToken) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
-			return;
-		}
-		if (!pollingPromise) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
-			return;
-		}
-		if (!config.allowedUserId) {
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("warning", "awaiting pairing")}`);
-			return;
-		}
-		if (activeTelegramTurn || queuedTelegramTurns.length > 0) {
-			const queued = queuedTelegramTurns.length > 0 ? theme.fg("muted", ` +${queuedTelegramTurns.length} queued`) : "";
-			ctx.ui.setStatus("telegram", `${label} ${theme.fg("accent", "processing")}${queued}`);
-			return;
-		}
-		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
 	}
 
 	async function callTelegram<TResponse>(
@@ -1441,6 +1449,11 @@ export default function (pi: ExtensionAPI) {
 					{ signal },
 				);
 				for (const update of updates) {
+					// If a previous update in this batch caused a session swap (e.g. /new
+					// via pi.executeCommand), our session_shutdown handler aborts this
+					// signal. Bail before touching the now-stale ctx — the new session's
+					// own polling loop will fetch this update from offset+1.
+					if (signal.aborted) break;
 					config.lastUpdateId = update.update_id;
 					await writeConfig(config);
 					await handleUpdate(update, ctx);

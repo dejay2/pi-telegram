@@ -45,6 +45,16 @@ The extension stores config in:
 ~/.pi/agent/telegram.json
 ```
 
+### Test bot / multiple configs
+
+Set `PI_TELEGRAM_CONFIG` to override the config path for that pi process — useful when you want a dev/test bot alongside a prod bot on the same box, or run several separate bots from the same machine.
+
+```bash
+PI_TELEGRAM_CONFIG=~/.pi/agent/telegram-test.json pi
+```
+
+The override applies to both reads and writes, so `/telegram-setup`, `lastUpdateId`, and `allowedUserId` all live in the alternate file. Unset the env var to fall back to the default config.
+
 ## Connect a pi session
 
 The Telegram bridge is session-local. Connect it only in the pi session that should own the bot:

@@ -1,5 +1,5 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
@@ -167,7 +167,9 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
+// PI_TELEGRAM_CONFIG overrides the config file path so dev/test bots can run
+// alongside a prod bot on the same box without clobbering the default config.
+const CONFIG_PATH = process.env.PI_TELEGRAM_CONFIG ?? join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
@@ -296,7 +298,7 @@ async function readConfig(): Promise<TelegramConfig> {
 }
 
 async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
+	await mkdir(dirname(CONFIG_PATH), { recursive: true });
 	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
 

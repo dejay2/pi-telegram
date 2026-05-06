@@ -1120,6 +1120,24 @@ export default function (pi: ExtensionAPI) {
 					);
 					return;
 				}
+				// /new replaces the session, which loads a fresh extension instance
+				// and stops the in-flight Telegram polling we're running on. Send a
+				// confirmation up-front so the user gets feedback even if the
+				// post-dispatch ack would otherwise race the swap.
+				const ackMessage = (name: string): string | undefined => {
+					switch (name) {
+						case "new": return "✓ Started a new pi session.";
+						case "compact": return "✓ Compaction triggered.";
+						case "reload": return "✓ Reloaded extensions, skills, and prompts.";
+						case "quit": return "✓ Shutting pi down.";
+						case "name": return "✓ Session name updated.";
+						case "copy": return "✓ Copied the last reply to pi's clipboard.";
+						case "share": return "✓ Share triggered — check pi's TUI for the gist URL.";
+						case "export": return "✓ Export triggered.";
+						case "session": return "✓ Session info shown in pi's TUI.";
+						default: return `✓ /${name} done.`;
+					}
+				};
 				try {
 					const handled = await exec(piName, cmdArgs);
 					if (!handled) {
@@ -1128,9 +1146,12 @@ export default function (pi: ExtensionAPI) {
 							firstMessage.message_id,
 							`/${piName} is no longer registered.`,
 						);
+					} else {
+						const ack = ackMessage(piName);
+						if (ack) {
+							await sendTextReply(firstMessage.chat.id, firstMessage.message_id, ack);
+						}
 					}
-					// On success: stay quiet — the command may produce a Telegram reply
-					// itself (via pi.sendUserMessage), or simply mutate session state.
 				} catch (error) {
 					const message = error instanceof Error ? error.message : String(error);
 					await sendTextReply(

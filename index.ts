@@ -1071,11 +1071,53 @@ export default function (pi: ExtensionAPI) {
 			const tgName = lower.slice(1).split(/[\s@]/)[0];
 			const piName = activeReverseMap.get(tgName);
 			if (piName) {
-				await sendTextReply(
-					firstMessage.chat.id,
-					firstMessage.message_id,
-					`/${piName} is a pi command that can't be invoked from Telegram yet. Run it from the pi TUI.`,
-				);
+				// Commands that need an interactive TUI selector or dialog can't run
+				// headless via pi.executeCommand — opening a picker on a Telegram-only
+				// machine would just hang. Block them up-front.
+				const TUI_ONLY = new Set([
+					"settings", "login", "logout", "scoped-models",
+					"fork", "clone", "tree", "resume", "import",
+					"hotkeys", "changelog",
+				]);
+				if (TUI_ONLY.has(piName)) {
+					await sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						`/${piName} needs the pi TUI (interactive picker or dialog). Run it directly from pi.`,
+					);
+					return;
+				}
+
+				const argSpace = rawText.indexOf(" ");
+				const cmdArgs = argSpace === -1 ? "" : rawText.slice(argSpace + 1).trim();
+				const exec = (pi as { executeCommand?: (name: string, args?: string) => Promise<boolean> }).executeCommand;
+				if (typeof exec !== "function") {
+					await sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						`/${piName}: this pi build doesn't support remote command dispatch. Upgrade pi or run the command from the TUI.`,
+					);
+					return;
+				}
+				try {
+					const handled = await exec(piName, cmdArgs);
+					if (!handled) {
+						await sendTextReply(
+							firstMessage.chat.id,
+							firstMessage.message_id,
+							`/${piName} is no longer registered.`,
+						);
+					}
+					// On success: stay quiet — the command may produce a Telegram reply
+					// itself (via pi.sendUserMessage), or simply mutate session state.
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					await sendTextReply(
+						firstMessage.chat.id,
+						firstMessage.message_id,
+						`/${piName} failed: ${message}`,
+					);
+				}
 				return;
 			}
 		}

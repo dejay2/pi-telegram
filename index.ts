@@ -416,27 +416,66 @@ export default function (pi: ExtensionAPI) {
 		return lowered.slice(0, 32);
 	}
 
+	// pi's built-in slash commands are NOT returned by pi.getCommands() — that
+	// only lists extension-registered commands, prompt templates, and skills.
+	// Mirrored from @mariozechner/pi-coding-agent/dist/core/slash-commands.js so
+	// the Telegram menu surfaces the full command set users see in the pi TUI.
+	const PI_BUILTIN_COMMANDS: ReadonlyArray<{ name: string; description: string }> = [
+		{ name: "settings", description: "Open settings menu" },
+		{ name: "model", description: "Select model" },
+		{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
+		{ name: "export", description: "Export session (HTML or JSONL)" },
+		{ name: "import", description: "Import and resume a session from a JSONL file" },
+		{ name: "share", description: "Share session as a secret GitHub gist" },
+		{ name: "copy", description: "Copy last agent message to clipboard" },
+		{ name: "name", description: "Set session display name" },
+		{ name: "session", description: "Show session info and stats" },
+		{ name: "changelog", description: "Show changelog entries" },
+		{ name: "hotkeys", description: "Show all keyboard shortcuts" },
+		{ name: "fork", description: "Create a new fork from a previous user message" },
+		{ name: "clone", description: "Duplicate the current session at the current position" },
+		{ name: "tree", description: "Navigate session tree (switch branches)" },
+		{ name: "login", description: "Configure provider authentication" },
+		{ name: "logout", description: "Remove provider authentication" },
+		{ name: "new", description: "Start a new session" },
+		{ name: "compact", description: "Manually compact the session context" },
+		{ name: "resume", description: "Resume a different session" },
+		{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
+		{ name: "quit", description: "Quit pi" },
+	];
+
 	function buildTelegramCommandList(): { payload: Array<{ command: string; description: string }>; reverseMap: Map<string, string> } {
 		const seen = new Set<string>();
 		const payload: Array<{ command: string; description: string }> = [];
 		const reverseMap = new Map<string, string>();
 
-		// Telegram conventions plus Telegram-only handlers
+		const addEntry = (originalName: string, description: string): void => {
+			const tgName = sanitizeTelegramCommandName(originalName);
+			if (!tgName || seen.has(tgName)) return;
+			const desc = (description ?? "pi command").slice(0, 256);
+			payload.push({ command: tgName, description: desc });
+			reverseMap.set(tgName, originalName);
+			seen.add(tgName);
+		};
+
+		// Telegram conventions plus Telegram-only handlers — these always run from Telegram.
 		payload.push({ command: "start", description: "Pair this Telegram account with the bot" });
 		payload.push({ command: "help", description: "Show Telegram bridge help" });
 		payload.push({ command: "stop", description: "Abort the current pi turn" });
 		for (const e of payload) seen.add(e.command);
 
+		// pi's built-ins (model, compact, new, fork, …)
+		for (const cmd of PI_BUILTIN_COMMANDS) {
+			if (payload.length >= 100) break;
+			addEntry(cmd.name, cmd.description);
+		}
+
+		// Extension-registered commands and prompt templates (skips skills — they use `:`).
 		for (const cmd of pi.getCommands()) {
+			if (payload.length >= 100) break;
 			if (cmd.source === "skill") continue;
 			if (cmd.name.includes(":")) continue;
-			const tgName = sanitizeTelegramCommandName(cmd.name);
-			if (!tgName || seen.has(tgName)) continue;
-			const desc = (cmd.description ?? "pi command").slice(0, 256);
-			payload.push({ command: tgName, description: desc });
-			reverseMap.set(tgName, cmd.name);
-			seen.add(tgName);
-			if (payload.length >= 100) break;
+			addEntry(cmd.name, cmd.description ?? "pi command");
 		}
 
 		return { payload, reverseMap };
